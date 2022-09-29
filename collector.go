@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/url"
 	"regexp"
@@ -15,79 +14,21 @@ import (
 
 	binrpc "github.com/florentchauveau/go-kamailio-binrpc/v3"
 	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
 )
-
-/* Sample output
-
-kamcmd> tm.stats
-{
-        current: 1
-        waiting: 0
-        total: 9514528
-        total_local: 2794613
-        rpl_received: 19902190
-        rpl_generated: 4965793
-        rpl_sent: 19908572
-        6xx: 7782
-        5xx: 2286589
-        4xx: 961055
-        3xx: 0
-        2xx: 6267549
-        created: 9514528
-        freed: 9514527
-        delayed_free: 0
-}
-kamcmd> sl.stats
-{
-        200: 666263
-        202: 0
-        2xx: 0
-        300: 0
-        301: 0
-        302: 0
-        400: 5883
-        401: 0
-        403: 0
-        404: 0
-        407: 0
-        408: 0
-        483: 0
-        4xx: 5621
-        500: 0
-        5xx: 0
-        6xx: 0
-		xxx: 0
-}
-kamcmd> core.shmmem
-{
-        total: 67108864
-        free: 61189608
-        used: 2590984
-        real_used: 5919256
-        max_used: 13323296
-        fragments: 44546
-}
-kamcmd> core.tcp_info
-{
-	readers: 8
-	max_connections: 4096
-	max_tls_connections: 2048
-	opened_connections: 595
-	opened_tls_connections: 401
-	write_queued_bytes: 0
-}
-kamcmd dlg.stats_active
-{
-	starting: 152
-	connecting: 674
-	answering: 0
-	ongoing: 512
-	all: 1338
-}
-*/
 
 // Collector implements prometheus.Collector (see below).
 // it also contains the config of the exporter.
+type PkgStatsEntry struct {
+	entry       int
+	pid         int
+	used        int
+	free        int
+	real_used   int
+	total_size  int
+	total_frags int
+}
+
 type Collector struct {
 	URI     string
 	Timeout time.Duration
@@ -128,6 +69,36 @@ const (
 )
 
 var (
+	pkgmem_used = prometheus.NewDesc(
+		"kamailio_pkgmem_used",
+		"Private memory used",
+		[]string{"entry"},
+		nil)
+
+	pkgmem_free = prometheus.NewDesc(
+		"kamailio_pkgmem_free",
+		"Private memory free",
+		[]string{"entry"},
+		nil)
+
+	pkgmem_real = prometheus.NewDesc(
+		"kamailio_pkgmem_real",
+		"Private memory real used",
+		[]string{"entry"},
+		nil)
+
+	pkgmem_size = prometheus.NewDesc(
+		"kamailio_pkgmem_size",
+		"Private memory total size",
+		[]string{"entry"},
+		nil)
+
+	pkgmem_frags = prometheus.NewDesc(
+		"kamailio_pkgmem_frags",
+		"Private memory total frags",
+		[]string{"entry"},
+		nil)
+
 	// this is used to match codes returned by Kamailio
 	// examples: "200" or "6xx" or even "xxx"
 	codeRegex = regexp.MustCompile("^[0-9x]{3}$")
@@ -136,6 +107,7 @@ var (
 	availableMethods = []string{
 		"tm.stats",
 		"sl.stats",
+		"pkg.stats",
 		"core.shmmem",
 		"core.uptime",
 		"core.tcp_info",
@@ -160,6 +132,15 @@ var (
 		},
 		"sl.stats": {
 			NewMetricCounter("codes", "Per-code counters.", "sl.stats"),
+		},
+		"pkg.stats": {
+			NewMetricGauge("entry", "Current process entry.", "pkg.stats"),
+			NewMetricGauge("pid", "Current process PID.", "pkg.stats"),
+			NewMetricGauge("used", "Used private memory.", "pkg.stats"),
+			NewMetricGauge("free", "Free private memory.", "pkg.stats"),
+			NewMetricGauge("real_used", "Real used private memory.", "pkg.stats"),
+			NewMetricGauge("total_size", "Total size of private memory.", "pkg.stats"),
+			NewMetricGauge("total_frags", "Number of fragments in private memory.", "pkg.stats"),
 		},
 		"core.shmmem": {
 			NewMetricGauge("total", "Total shared memory.", "core.shmmem"),
@@ -398,14 +379,17 @@ func (c *Collector) scrapeMethod(method string) (map[string][]MetricValue, error
 		return nil, err
 	}
 
-	// we expect just 1 record of type map
-	if len(records) == 2 && records[0].Type == binrpc.TypeInt && records[0].Value.(int) == 500 {
-		return nil, fmt.Errorf(`invalid response for method "%s": [500] %s`, method, records[1].Value.(string))
-	} else if len(records) != 1 {
-		return nil, fmt.Errorf(`invalid response for method "%s", expected %d record, got %d`,
-			method, 1, len(records),
-		)
-	}
+	//This is disabled to allow a set of record for process private memory metrics
+	/*
+		// we expect just 1 record of type map
+		if len(records) == 2 && records[0].Type == binrpc.TypeInt && records[0].Value.(int) == 500 {
+			return nil, fmt.Errorf(`invalid response for method "%s": [500] %s`, method, records[1].Value.(string))
+		} else if len(records) != 1 {
+			return nil, fmt.Errorf(`invalid response for method "%s", expected %d record, got %d`,
+				method, 1, len(records),
+			)
+		}
+	*/
 
 	// all methods implemented in this exporter return a struct
 	items, err := records[0].StructItems()
@@ -436,6 +420,43 @@ func (c *Collector) scrapeMethod(method string) (map[string][]MetricValue, error
 			} else {
 				metrics[item.Key] = []MetricValue{{Value: float64(i)}}
 			}
+		}
+	case "pkg.stats":
+		// convert each pkg entry to a series of metrics
+		for _, record := range records {
+			items, _ := record.StructItems()
+			entry := PkgStatsEntry{}
+			for _, item := range items {
+				switch item.Key {
+				case "entry":
+					entry.entry, _ = item.Value.Int()
+				case "pid":
+					entry.pid, _ = item.Value.Int()
+				case "used":
+					entry.used, _ = item.Value.Int()
+				case "free":
+					entry.free, _ = item.Value.Int()
+				case "real_used":
+					entry.real_used, _ = item.Value.Int()
+				case "total_size":
+					entry.total_size, _ = item.Value.Int()
+				case "total_frags":
+					entry.total_frags, _ = item.Value.Int()
+				}
+			}
+			mv := MetricValue{
+				Value: 1,
+				Labels: map[string]string{
+					"entry":       strconv.Itoa(entry.entry),
+					"pid":         strconv.Itoa(entry.pid),
+					"used":        strconv.Itoa(entry.used),
+					"free":        strconv.Itoa(entry.free),
+					"real_used":   strconv.Itoa(entry.real_used),
+					"total_size":  strconv.Itoa(entry.total_size),
+					"total_frags": strconv.Itoa(entry.total_frags),
+				},
+			}
+			metrics["entry"] = append(metrics["entry"], mv)
 		}
 	case "tls.info":
 		fallthrough
